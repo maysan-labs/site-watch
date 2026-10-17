@@ -59,6 +59,7 @@ jobs:
         if: always()
         env:
           FAILED: ${{ steps.probe.outcome == 'failure' || inputs.force_fail }}
+          FORCE_FAIL: ${{ inputs.force_fail }}
         run: |
           node - <<'NODE'
           const failed = process.env.FAILED === "true";
@@ -71,8 +72,10 @@ jobs:
           // Transition-only, so a site that stays down does not spam every 30 minutes.
           if (!failed) { console.log("site is well - no alert"); process.exit(0); }
           if (prev && prev.conclusion === "failure") { console.log("previous run already failed - alert suppressed"); process.exit(1); }
+          // A falsification run must never read as a real outage on someone's phone.
+          const test = process.env.FORCE_FAIL === "true";
           const body = [
-            "🔴 *maysanlabs.com is failing the off-box check*",
+            test ? "🧪 *TEST (falsification run — ignore): alert path works*" : "🔴 *maysanlabs.com is failing the off-box check*",
             "A content/deploy assertion failed on a page (or the site is unreachable).",
             `Run: https://github.com/${repo}/actions/runs/${runId}`,
             "This check runs OUTSIDE the VPS, so it is also the signal when the box itself is gone.",
