@@ -1,0 +1,85 @@
+name: site-watch
+
+# Off-box content watchdog for maysanlabs.com.
+#
+# WHY THIS REPO EXISTS: the same checks live in the private maysanlabs repo, but that org is on the GitHub
+# Free plan with a private repo, so the 2,000 included Actions minutes ran out mid-month and EVERY workflow
+# started failing in 3 seconds without a runner ("recent account payments have failed or your spending limit
+# needs to be increased"). Public repositories get unlimited free Actions minutes, so the backstop that must
+# survive a VPS-level failure lives here instead - with no business code and no secrets in the repo.
+#
+# It also covers the gap the on-box crons cannot: they run on the same VPS as the site, so a dead proxy or a
+# rebooted box is exactly the case where nothing on it can alert.
+on:
+  schedule:
+    - cron: '7,37 * * * *'     # twice an hour; public repos are not metered
+  workflow_dispatch:
+    inputs:
+      force_fail:
+        description: 'Falsification test: probe a URL that must fail, to prove the alert path'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read                # to read the previous run's outcome (alert only on transitions)
+
+concurrency:
+  group: site-watch
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: probe the live site from outside the VPS
+        id: probe
+        continue-on-error: true
+        run: node check.mjs
+
+      - name: falsification probe (dispatch only)
+        if: ${{ inputs.force_fail }}
+        continue-on-error: true
+        run: |
+          echo '{"x":1}' > /dev/null
+          node -e 'fetch("https://maysanlabs.com/this-page-does-not-exist-maysan-check").then(r=>{console.log("probe got",r.status);process.exit(r.status===200?1:0)})'
+
+      - name: alert only on a transition
+        if: always()
+        env:
+          FAILED: ${{ steps.probe.outcome == 'failure' || inputs.force_fail }}
+        run: |
+          node - <<'NODE'
+          const failed = process.env.FAILED === "true";
+          const repo = process.env.GITHUB_REPOSITORY, runId = process.env.GITHUB_RUN_ID;
+          const api = `https://api.github.com/repos/${repo}/actions/runs?per_page=3`;
+          const runs = await (await fetch(api, { headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`,
+            Accept: "application/vnd.github+json" } })).json();
+          const prev = (runs.workflow_runs || []).find((r) => String(r.id) !== runId && r.status === "completed");
+          // The alert is the product; a green tick on a broken site is how an outage hides in plain sight.
+          // Transition-only, so a site that stays down does not spam every 30 minutes.
+          if (!failed) { console.log("site is well - no alert"); process.exit(0); }
+          if (prev && prev.conclusion === "failure") { console.log("previous run already failed - alert suppressed"); process.exit(1); }
+          const body = [
+            "🔴 *maysanlabs.com is failing the off-box check*",
+            "A content/deploy assertion failed on a page (or the site is unreachable).",
+            `Run: https://github.com/${repo}/actions/runs/${runId}`,
+            "This check runs OUTSIDE the VPS, so it is also the signal when the box itself is gone.",
+          ].join("\n");
+          const tg = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+          const r = await fetch(tg, { method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ chat_id: process.env.TELEGRAM_CHAT_ID, text: body, parse_mode: "Markdown" }) });
+          console.log("telegram:", r.status, await r.text());
+          process.exit(1);
+          NODE
